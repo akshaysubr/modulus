@@ -88,6 +88,10 @@ class Trainer():
 
         self.model = model.to(device=self.device)
 
+        # torch._dynamo.reset()
+        # compile_mode = "reduce-overhead"
+        # self.model = torch.compile(self.model, mode=compile_mode)
+
         self.dist = DistributedManager()
 
         # Initialize logger.
@@ -288,71 +292,87 @@ class Trainer():
             # Train: iterate over all training samples
             training_step = 0
             self.model.train()
-            for inputs, target in (pbar := tqdm(self.dataloader_train, disable=(not self.print_to_screen))):
-                pbar.set_description(f"Training   epoch {epoch+1}/{self.max_epochs}")
+            with torch.autograd.profiler.emit_nvtx():
+                for inputs, target in (pbar := tqdm(self.dataloader_train, disable=(not self.print_to_screen))):
+                    if training_step == 50:
+                        print(f"Starting profiler at after {training_step} steps")
+                        torch.cuda.profiler.start()
+                    if training_step == 60:
+                        torch.cuda.profiler.stop()
+                        print(f"Stopping profiler at after {training_step} steps")
 
-                # Trach epoch in tensorboard
-                if self.dist.rank == 0:
-                    self.writer.add_scalar(tag="epoch", scalar_value=epoch, global_step=iteration)
+                    pbar.set_description(f"Training   epoch {epoch+1}/{self.max_epochs}")
 
-                torch.cuda.nvtx.range_push(f"training step {training_step}") 
-                
-                inputs = [x.to(device=self.device) for x in inputs]
-                target = target.to(device=self.device)
-                
-                # do optimizer step
-                if self.train_graph is not None:
-                    # copy data into entry nodes
-                    for idx, inp in enumerate(inputs):
-                        self.static_inp[idx].copy_(inp)
+                    # Trach epoch in tensorboard
+                    if self.dist.rank == 0:
+                        self.writer.add_scalar(tag="epoch", scalar_value=epoch, global_step=iteration)
 
-                    self.static_tar.copy_(target)
+                    torch.cuda.nvtx.range_push(f"training step {training_step}") 
+                    
+                    inputs = [x.to(device=self.device) for x in inputs]
+                    target = target.to(device=self.device)
+                    
+                    # do optimizer step
+                    if self.train_graph is not None:
+                        # copy data into entry nodes
+                        for idx, inp in enumerate(inputs):
+                            self.static_inp[idx].copy_(inp)
 
-                    # replay
-                    self.train_graph.replay()
+                        self.static_tar.copy_(target)
 
-                    # extract loss
-                    output = self.static_gen_train
-                    train_loss = self.static_loss_train
-                else:
-                    # zero grads
-                    self.model.zero_grad(set_to_none=True)
+                        torch.cuda.nvtx.range_push("graph replay") 
+                        # replay
+                        self.train_graph.replay()
+                        torch.cuda.nvtx.range_pop() 
 
-                    if self.amp_enable:
-                        with amp.autocast(enabled=self.amp_enable, dtype=self.amp_dtype):
+                        # extract loss
+                        output = self.static_gen_train
+                        train_loss = self.static_loss_train
+                    else:
+                        # zero grads
+                        self.model.zero_grad(set_to_none=True)
+
+                        if self.amp_enable:
+                            torch.cuda.nvtx.range_push("AMP no graph") 
+                            with amp.autocast(enabled=self.amp_enable, dtype=self.amp_dtype):
           
+                                output = self.model(inputs)
+                                train_loss = self.criterion(output, target)
+                            torch.cuda.nvtx.range_pop() 
+                        else:
+                            torch.cuda.nvtx.range_push("no AMP no graph") 
                             output = self.model(inputs)
                             train_loss = self.criterion(output, target)
+                            torch.cuda.nvtx.range_pop() 
+                    
+                        self.gscaler.scale(train_loss).backward()
+
+                    # Gradient clipping                
+                    self.gscaler.unscale_(self.optimizer)
+                    try:
+                        curr_lr = self.optimizer.param_groups[-1]["lr"] if self.lr_scheduler is None else self.lr_scheduler.get_last_lr()[0]
+                    except AttributeError:  # try loop required since LearnOnPlateau has no "get_last_lr" attribute
+                        curr_lr = self.optimizer.param_groups[-1]["lr"] if self.lr_scheduler is None else self.optimizer.param_groups[0]['lr']
+                    # check that max norm was not given to trainer 
+                    if self.max_norm is None:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), curr_lr)
                     else:
-                        output = self.model(inputs)
-                        train_loss = self.criterion(output, target)
-                
-                    self.gscaler.scale(train_loss).backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
+                    
+                    # Optimizer step
+                    torch.cuda.nvtx.range_push("optimizer") 
+                    self.gscaler.step(self.optimizer)
+                    self.gscaler.update()
+                    torch.cuda.nvtx.range_pop() 
+                                    
+                    pbar.set_postfix({"Loss": train_loss.item()})
 
-                # Gradient clipping                
-                self.gscaler.unscale_(self.optimizer)
-                try:
-                    curr_lr = self.optimizer.param_groups[-1]["lr"] if self.lr_scheduler is None else self.lr_scheduler.get_last_lr()[0]
-                except AttributeError:  # try loop required since LearnOnPlateau has no "get_last_lr" attribute
-                    curr_lr = self.optimizer.param_groups[-1]["lr"] if self.lr_scheduler is None else self.optimizer.param_groups[0]['lr']
-                # check that max norm was not given to trainer 
-                if self.max_norm is None:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), curr_lr)
-                else:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
-                
-                # Optimizer step
-                self.gscaler.step(self.optimizer)
-                self.gscaler.update()
-                                
-                pbar.set_postfix({"Loss": train_loss.item()})
+                    torch.cuda.nvtx.range_pop()
 
-                torch.cuda.nvtx.range_pop()
-
-                if self.dist.rank == 0:
-                    self.writer.add_scalar(tag="loss", scalar_value=train_loss, global_step=iteration)
-                iteration += 1
-                training_step += 1
+                    if self.dist.rank == 0:
+                        self.writer.add_scalar(tag="loss", scalar_value=train_loss, global_step=iteration)
+                    iteration += 1
+                    training_step += 1
 
             torch.cuda.nvtx.range_pop()
             torch.cuda.nvtx.range_push(f"validation epoch {epoch}")  
