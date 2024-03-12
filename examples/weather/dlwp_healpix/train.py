@@ -78,7 +78,7 @@ def train(cfg):
                    if cfg.trainer.lr_scheduler is not None else None
 
     # setup startup values
-    epoch = 0
+    epoch = 1
     val_error = th.inf
     iteration = 0
     epochs_since_improved = 0
@@ -110,7 +110,7 @@ def train(cfg):
             logger0.info(f"Checkpoint not found, weights not loaded. Requested path: {checkpoint_path}")
 
     # Instantiate the trainer and fit the model
-    logger0.info(f"instantiating model")
+    logger0.info("instantiating model")
     trainer = instantiate(
         cfg.trainer,
         model=model,
@@ -120,7 +120,7 @@ def train(cfg):
         lr_scheduler=lr_scheduler,
         device=dist.device
         )
-    logger0.info(f"starting training")
+    logger0.info("starting training")
     trainer.fit(
         epoch=epoch,
         validation_error=val_error,
